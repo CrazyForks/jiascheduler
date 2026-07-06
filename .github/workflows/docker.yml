@@ -37,9 +37,21 @@ jobs:
 
   docker:
     needs: build-frontend
-    runs-on: ubuntu-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+
       - uses: actions/checkout@v4
 
       - name: Download frontend dist
@@ -48,6 +60,44 @@ jobs:
           name: frontend-dist
           path: dist
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          # 进入 GitHub 仓库 -> Settings -> Secrets and variables -> Actions -> Repository secrets
+          # 创建DOCKER_PAT变量，填入你的Docker令牌
+          password: ${{ secrets.DOCKER_PAT }} # 使用 DOCKER_PAT 作为密码
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: docker
+    runs-on: ubuntu-latest
+    steps:
       - name: Get tag name or default to latest
         id: get-tag
         run: |
@@ -59,29 +109,28 @@ jobs:
           echo "Tag name: $TAG_NAME"
           echo "::set-output name=tag_name::$TAG_NAME"
 
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ env.DOCKER_USERNAME }}
-          # 进入 GitHub 仓库 -> Settings -> Secrets and variables -> Actions -> Repository secrets
-          # 创建DOCKER_PAT变量，填入你的Docker令牌
-          password: ${{ secrets.DOCKER_PAT }} # 使用 DOCKER_PAT 作为密码
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+          password: ${{ secrets.DOCKER_PAT }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ steps.get-tag.outputs.tag_name }}
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE_NAME }}:${{ steps.get-tag.outputs.tag_name }} \
+            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
       - name: Verify pushed image
         run: docker pull ${{ env.IMAGE_NAME }}:${{ steps.get-tag.outputs.tag_name }}
